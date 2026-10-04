@@ -3,8 +3,13 @@
 _litellm_models() {
   local command=$words[1]
   local -a models
-  models=("${(@f)$(litellm _complete "$command" 2>/dev/null)}")
-  _describe -t models 'model' models
+  if [[ $command == add ]]; then
+    models=("${(@f)$(litellm _complete add "$PREFIX" --describe 2>/dev/null)}")
+    _describe -t models -V 'Hugging Face models · relevance / popularity' models -U
+  else
+    models=("${(@f)$(litellm _complete "$command" 2>/dev/null)}")
+    _describe -t models 'registered model' models
+  fi
 }
 
 _litellm() {

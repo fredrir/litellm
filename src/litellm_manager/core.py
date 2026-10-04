@@ -1,10 +1,10 @@
 import fcntl
 import json
 import os
-import secrets
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -18,6 +18,8 @@ import click
 import yaml
 
 from .catalog import preset_for
+from .metadata import model_metadata, token_limits
+from .settings import Settings
 
 
 @dataclass
@@ -45,6 +47,7 @@ class Model:
 
 class Store:
     def __init__(self):
+        self.settings = Settings()
         home = Path.home()
         self.config = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")) / "litellm-manager"
         self.data = Path(os.environ.get("XDG_DATA_HOME", home / ".local/share")) / "litellm-manager"
@@ -54,9 +57,7 @@ class Store:
         self.units = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")) / "systemd/user"
         self.registry = self.config / "models.json"
         self.proxy_config = self.config / "proxy.yaml"
-        self.proxy_port = int(os.environ.get("LITELLM_PORT", "4010"))
-        if not 1024 <= self.proxy_port <= 65535:
-            raise click.ClickException("LITELLM_PORT must be between 1024 and 65535.")
+        self.proxy_port = self.settings.port
 
     def read(self) -> list[Model]:
         if not self.registry.exists():
@@ -149,15 +150,10 @@ def download_model(
     canonical = found[0] if found else name
     if any(m.name.casefold() == canonical.casefold() for m in models):
         raise click.ClickException(f"Already added: {canonical}")
-    trained = preset.trained_context if preset else None
-    ctx = context or (preset.context if preset else 8192)
-    out = output or (preset.output if preset else min(4096, ctx // 2))
-    if out >= ctx:
+    if context and output and output >= context:
         raise click.ClickException(
             "--output must be smaller than --context (prompt/image tokens need space)."
         )
-    if trained and ctx > trained:
-        raise click.ClickException(f"--context exceeds the model's trained context ({trained}).")
     port = available_port(models, proxy_port)
     if Path(name).expanduser().is_file():
         path = gguf_file(name)
@@ -168,7 +164,10 @@ def download_model(
         source, revision = "local", "local"
     else:
         source = repo or (preset.repo if preset else name)
-        info = HfApi().model_info(source, revision=preset.revision if preset and not repo else None)
+        token = Settings().values.get("HF_TOKEN")
+        info = HfApi(token=token).model_info(
+            source, revision=preset.revision if preset and not repo else None
+        )
         revision = info.sha  # Pin every download, including custom models, to one snapshot.
         files = [s.rfilename for s in info.siblings]
         model_file = filename or (preset.filename if preset and not repo else None)
@@ -195,23 +194,29 @@ def download_model(
         for file in [model_file, projector_file]:
             if file and file not in files:
                 raise click.ClickException(f"File not found in {source}@{revision}: {file}")
-        path = gguf_file(hf_hub_download(source, model_file, revision=revision))
+        path = gguf_file(hf_hub_download(source, model_file, revision=revision, token=token))
         projector = (
-            gguf_file(hf_hub_download(source, projector_file, revision=revision))
+            gguf_file(hf_hub_download(source, projector_file, revision=revision, token=token))
             if projector_file
             else None
         )
+    metadata = model_metadata(path, projector)
+    trained = metadata["trained_context"]
+    if context and context > trained:
+        raise click.ClickException(f"--context exceeds the model's trained context ({trained}).")
+    if output and output >= (context or trained):
+        raise click.ClickException("--output must be smaller than the model context.")
     return Model(
         canonical,
         source,
         revision,
         path,
         projector,
-        params or (preset.params if preset else "?"),
-        ctx,
-        out,
+        params or metadata["params"],
+        context or 0,
+        output or -1,
         trained,
-        tools if tools is not None else bool(preset and preset.tools),
+        tools if tools is not None else metadata["tools"],
         port,
         preset.cache if preset else "f16",
         preset.temperature if preset else 0.0,
@@ -271,8 +276,6 @@ class Services:
             "127.0.0.1",
             "--port",
             str(model.port),
-            "--ctx-size",
-            str(model.context),
             "--n-predict",
             str(model.output),
             "--parallel",
@@ -292,12 +295,11 @@ class Services:
             "--ubatch-size",
             "256",
             "--jinja",
+            "--no-context-shift",
             "--fit",
             "on",
             "--fit-target",
             "1024",
-            "--fit-ctx",
-            str(model.context),
             "--temp",
             str(model.temperature),
             "--top-k",
@@ -309,6 +311,9 @@ class Services:
             "--repeat-penalty",
             "1",
         ]
+        # Omit --ctx-size in auto mode. Explicit zero disables the upstream fitter!
+        if model.context:
+            args.extend(["--ctx-size", str(model.context)])
         # Leave n-gpu-layers unset: llama.cpp's fitter uses current free VRAM,
         # offloading every layer when possible and falling back to CPU when necessary.
         if model.mmproj:
@@ -322,6 +327,12 @@ class Services:
             if backend
             else ("Environment=LITELLM_LOCAL_MODEL_COST_MAP=True\nEnvironment=DO_NOT_TRACK=1\n")
         )
+        if not backend:
+            environment += (
+                "Environment="
+                + systemd_quote("LITELLM_ENV_FILE=" + str(self.store.settings.env_file))
+                + "\n"
+            )
         atomic_write(
             self.store.units / unit,
             "[Unit]\nDescription=Local LiteLLM model service\n\n[Service]\n"
@@ -331,10 +342,7 @@ class Services:
         )
 
     def configure_proxy(self, models: list[Model]):
-        key_path = self.store.config / "api-key"
-        if not key_path.exists():
-            atomic_write(key_path, "sk-" + secrets.token_hex(32) + "\n")
-        key = key_path.read_text().strip()
+        self.store.settings.require_key()
         rows = []
         for model in models:
             rows.append(
@@ -344,26 +352,27 @@ class Services:
                         "model": "openai/" + model.name,
                         "api_base": f"http://127.0.0.1:{model.port}/v1",
                         "api_key": "local",
-                        "max_tokens": model.output,
                     },
                     "model_info": {
                         "mode": "chat",
                         "supported_endpoints": ["/v1/chat/completions", "/v1/responses"],
                         "supports_vision": bool(model.mmproj),
                         "supports_function_calling": model.tools,
-                        "max_input_tokens": model.context,
-                        "max_output_tokens": model.output,
+                        "max_input_tokens": token_limits(model)["max_input_tokens"],
+                        "max_output_tokens": token_limits(model)["max_output_tokens"],
                         "input_cost_per_token": 0,
                         "output_cost_per_token": 0,
                     },
                 }
             )
+            if model.output > 0:
+                rows[-1]["litellm_params"]["max_tokens"] = model.output
         atomic_write(
             self.store.proxy_config,
             yaml.safe_dump(
                 {
                     "model_list": rows,
-                    "general_settings": {"master_key": key},
+                    "general_settings": {"master_key": "os.environ/LITELLM_MASTER_KEY"},
                     "litellm_settings": {"telemetry": False, "request_timeout": 300},
                     "router_settings": {"num_retries": 0},
                 },
@@ -376,6 +385,9 @@ class Services:
         self.write_unit(
             self.proxy_unit,
             [
+                sys.executable,
+                "-m",
+                "litellm_manager.runtime",
                 str(proxy),
                 "--config",
                 str(self.store.proxy_config),
@@ -386,6 +398,13 @@ class Services:
             ],
         )
         self.ctl("daemon-reload")
+        atomic_write(self.store.state / "settings-fingerprint", self.settings_fingerprint())
+
+    def settings_fingerprint(self):
+        settings = self.store.settings
+        return sha256(
+            f"{settings.url}\n{settings.port}\n{settings.require_key()}".encode()
+        ).hexdigest()
 
     def refresh(self, models: list[Model]):
         was_active = self.active(self.proxy_unit)
@@ -450,6 +469,11 @@ class Services:
             self.ctl("start", model.unit)
         try:
             self.wait_ready(model.unit, model.port, "/health", timeout)
+            marker = self.store.state / "settings-fingerprint"
+            if self.active(self.proxy_unit) and (
+                not marker.exists() or marker.read_text() != self.settings_fingerprint()
+            ):
+                self.refresh(models)
             if not self.active(self.proxy_unit):
                 if not port_free(self.store.proxy_port):
                     raise click.ClickException(
@@ -485,6 +509,15 @@ def healthy(port: int, route: str, timeout: float = 0.3) -> bool:
             return response.status == 200
     except (OSError, urllib.error.URLError):
         return False
+
+
+def get_json(port: int, route: str, timeout: float = 0.3) -> dict:
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{port}{route}", timeout=timeout) as response:
+            return json.load(response)
+    except (OSError, ValueError):
+        return {}
 
 
 def systemd_quote(arg: str) -> str:

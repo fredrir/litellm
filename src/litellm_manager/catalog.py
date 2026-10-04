@@ -8,9 +8,6 @@ class Preset:
     filename: str
     mmproj: str
     params: str
-    context: int
-    output: int
-    trained_context: int
     tools: bool = False
     cache: str = "f16"
     temperature: float = 0.0
@@ -26,9 +23,6 @@ CATALOG = {
         "granite-docling-258M-f16.gguf",
         "mmproj-granite-docling-258M-f16.gguf",
         "258M",
-        8192,
-        4096,
-        8192,
     ),
     "PaddlePaddle/PaddleOCR-VL-1.6": Preset(
         "PaddlePaddle/PaddleOCR-VL-1.6-GGUF",
@@ -36,9 +30,6 @@ CATALOG = {
         "PaddleOCR-VL-1.6-GGUF.gguf",
         "PaddleOCR-VL-1.6-GGUF-mmproj.gguf",
         "900M",
-        16384,
-        8192,
-        131072,
     ),
     "google/gemma-4-12B-it": Preset(
         "google/gemma-4-12B-it-qat-q4_0-gguf",
@@ -46,9 +37,18 @@ CATALOG = {
         "gemma-4-12b-it-qat-q4_0.gguf",
         "mmproj-gemma-4-12b-it-qat-q4_0.gguf",
         "12B",
-        16384,
-        4096,
-        262144,
+        tools=True,
+        cache="q8_0",
+        temperature=1.0,
+        top_k=64,
+        top_p=0.95,
+    ),
+    "unsloth/gemma-4-12b-it-GGUF": Preset(
+        "unsloth/gemma-4-12b-it-GGUF",
+        "fc034cfff751157913579611efad8462ac1be606",
+        "gemma-4-12b-it-UD-Q8_K_XL.gguf",
+        "mmproj-F16.gguf",
+        "12B",
         tools=True,
         cache="q8_0",
         temperature=1.0,

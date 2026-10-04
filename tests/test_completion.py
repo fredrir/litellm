@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import select
@@ -6,6 +7,7 @@ import shutil
 import signal
 import sys
 import time
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -16,6 +18,15 @@ def test_real_zsh_tab_completes_commands_flags_and_catalog_models(tmp_path, monk
     import pty
 
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("LITELLM_COMPLETION_OFFLINE", "1")
+    cache = tmp_path / "state/litellm-manager/hub-completion"
+    cache.mkdir(parents=True)
+    (cache / (sha256(b"g4test").hexdigest() + ".json")).write_text(
+        json.dumps(
+            {"time": time.time(), "models": [{"id": "publisher/gemma-4-GGUF", "downloads": 1234}]}
+        )
+    )
     # Use this test's Python environment, independent of the installed user launcher.
     launcher = tmp_path / "litellm"
     launcher.write_text(
@@ -51,8 +62,9 @@ def test_real_zsh_tab_completes_commands_flags_and_catalog_models(tmp_path, monk
             ("litellm sta", "litellm start "),
             ("litellm start --ti", "litellm start --timeout "),
             ("litellm add --co", "litellm add --context "),
-            ("litellm add gem", "litellm add gemma-4-12B-it "),
+            ("litellm add unsl", "litellm add unsloth/gemma-4-12b-it-GGUF "),
             ("litellm add goog", "litellm add google/gemma-4-12B-it "),
+            ("litellm add g4test", "litellm add publisher/gemma-4-GGUF "),
         ]:
             os.write(master, b"\x15" + typed.encode() + b"\t\x18")
             assert until(r"RESULT:([^\r\n]*)\r\n").group(1) == expected

@@ -14,6 +14,10 @@ from litellm_manager.core import Model, Services, Store, download_model, resolve
 
 @pytest.fixture
 def store(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text("LITELLM_API_KEY=my-test-key\nLITELLM_URL=http://litellm.localhost\n")
+    monkeypatch.setenv("LITELLM_ENV_FILE", str(env_file))
+    monkeypatch.setenv("LITELLM_COMPLETION_OFFLINE", "1")
     for env, directory in [
         ("XDG_CONFIG_HOME", "config"),
         ("XDG_DATA_HOME", "data"),
@@ -27,10 +31,21 @@ def store(tmp_path, monkeypatch):
 @pytest.fixture
 def model(tmp_path):
     path = tmp_path / "model.gguf"
-    path.write_bytes(b"GGUFtest")
+    write_gguf(path)
     return Model(
         "test/model", "local", "local", str(path), None, "1B", 8192, 2048, None, False, 8100
     )
+
+
+def write_gguf(path):
+    from gguf import GGUFWriter
+
+    writer = GGUFWriter(str(path), "llama")
+    writer.add_context_length(8192)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
 
 
 def test_registry_round_trip_and_unique_short_names(store, model):
@@ -60,12 +75,12 @@ def test_corrupt_registry_is_not_silently_overwritten(store):
 
 def test_reject_output_larger_than_context_before_network(store):
     with pytest.raises(click.ClickException, match="smaller than"):
-        download_model("google/gemma-4-12B-it", [], 4010, output=20000)
+        download_model("google/gemma-4-12B-it", [], 4010, context=8192, output=20000)
 
 
-def test_reject_context_beyond_model_limit(store):
+def test_reject_context_beyond_model_limit(store, model):
     with pytest.raises(click.ClickException, match="trained context"):
-        download_model("granite-docling-258M", [], 4010, context=16384)
+        download_model(model.path, [], 4010, context=16384)
 
 
 def test_local_add_requires_gguf_and_detects_duplicates(store, tmp_path):
@@ -73,30 +88,40 @@ def test_local_add_requires_gguf_and_detects_duplicates(store, tmp_path):
     path.write_bytes(b"invalid")
     with pytest.raises(click.ClickException, match="Not a GGUF"):
         download_model(str(path), [], 4010)
-    path.write_bytes(b"GGUFtest")
+    write_gguf(path)
     added = download_model(str(path), [], 4010)
     assert added.name == "local"
     with pytest.raises(click.ClickException, match="Already added"):
         download_model(str(path), [added], 4010)
 
 
-def test_completion_reads_registry_without_network_or_systemd(store, model, monkeypatch):
+def test_add_completion_reads_registry_without_network_or_systemd(store, model, monkeypatch):
     store.save([model])
 
     def forbidden(*args, **kwargs):
-        pytest.fail("Completion must not call systemctl or the network")
+        pytest.fail("Add completion must not call systemctl or the network")
 
     monkeypatch.setattr(subprocess, "run", forbidden)
     result = CliRunner().invoke(cli, ["_complete", "add"])
     assert result.exit_code == 0
-    assert set(result.output.splitlines()) == {
-        model.name,
-        "model",
-        *CATALOG,
-        *(name.split("/")[-1] for name in CATALOG),
-    }
+    assert set(result.output.splitlines()) == set(CATALOG)
+
+
+def test_stop_completion_only_lists_running_models(store, model, monkeypatch):
+    running = replace(model, name="test/running", port=8101)
+    stopped = replace(model, name="test/stopped", port=8102)
+    store.save([running, stopped])
+    monkeypatch.setattr(Services, "active", lambda self, unit: unit == running.unit)
     result = CliRunner().invoke(cli, ["_complete", "stop"])
-    assert set(result.output.splitlines()) == {model.name, "model"}
+    assert result.exit_code == 0
+    assert set(result.output.splitlines()) == {"running"}
+
+
+def test_completion_prefers_full_names_for_ambiguous_short_names(store, model):
+    store.save([model, replace(model, name="another/model", port=8101)])
+    result = CliRunner().invoke(cli, ["_complete", "logs"])
+    assert result.exit_code == 0
+    assert set(result.output.splitlines()) == {"test/model", "another/model"}
 
 
 def test_failed_registry_change_restores_gateway_config(store, monkeypatch):
@@ -131,7 +156,12 @@ def test_proxy_routes_only_to_local_backends(store, model, monkeypatch):
     runtime.touch()
     monkeypatch.setattr(Services, "ctl", lambda *args, **kwargs: None)
     Services(store).configure_proxy([model])
-    assert (store.config / "api-key").stat().st_mode & 0o777 == 0o600
+    assert not (store.config / "api-key").exists()
+    assert "my-test-key" not in store.proxy_config.read_text()
+    assert (
+        yaml.safe_load(store.proxy_config.read_text())["general_settings"]["master_key"]
+        == "os.environ/LITELLM_MASTER_KEY"
+    )
     row = yaml.safe_load(store.proxy_config.read_text())["model_list"][0]
     assert row["model_name"] == model.name
     assert row["litellm_params"]["model"] == "openai/test/model"

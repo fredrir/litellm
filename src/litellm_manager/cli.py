@@ -3,26 +3,66 @@ import subprocess
 from dataclasses import asdict
 from pathlib import Path
 
-import click
+import rich_click as click
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from .catalog import CATALOG
 from .core import Services, Store, available_port, download_model, healthy, resolve
+from .metadata import token_limits
 
 console = Console()
 if not console.is_terminal:
     console = Console(width=140)
 
 
-@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+@click.group(context_settings={"help_option_names": ["-h", "--help"]}, invoke_without_command=True)
 @click.version_option("0.1.0")
-def cli():
-    """Manage local llama.cpp models through LiteLLM at http://127.0.0.1:4010/v1.
+@click.pass_context
+def cli(ctx):
+    """Local models, native CUDA, one LiteLLM gateway.
 
     Full Hugging Face IDs and unique short model names are accepted.
-    LITELLM_PORT overrides the gateway port; LLAMA_SERVER overrides the runtime.
+    Configure LITELLM_URL and LITELLM_API_KEY in .env.
     """
+    if ctx.invoked_subcommand is None:
+        store = Store()
+        console.print(
+            Panel(
+                Text.assemble(
+                    ("Lite", "bold cyan"),
+                    ("LLM", "bold magenta"),
+                    (f"\n{store.settings.api_url}", "bright_blue"),
+                ),
+                border_style="cyan",
+                padding=(1, 2),
+            )
+        )
+        ctx.invoke(list_models)
+        commands = Text()
+        for name, style, argument in (
+            ("add", "bold green", "<model>"),
+            ("start", "bold cyan", "<model>"),
+            ("stop", "bold yellow", "<model>"),
+            ("remove", "bold red", "<model>"),
+            ("list", "bold blue", None),
+            ("logs", "bold magenta", None),
+            ("--help", "bold", None),
+        ):
+            if len(commands):
+                commands.append("\n")
+            commands.append(name.ljust(7), style)
+            if argument:
+                commands.append(argument, "dim")
+        console.print(
+            Panel(
+                commands,
+                title="[bold cyan]Commands[/]",
+                border_style="bright_black",
+            )
+        )
 
 
 @cli.command()
@@ -31,9 +71,15 @@ def cli():
 @click.option("--file", "filename", help="Exact GGUF filename in the repository.")
 @click.option("--mmproj", help="Matching vision projector filename (or path for a local model).")
 @click.option(
-    "--context", type=click.IntRange(min=512), help="Total tokens per request, including output."
+    "--context",
+    type=click.IntRange(min=1),
+    help="Optional context ceiling; defaults to automatic memory fit.",
 )
-@click.option("--output", type=click.IntRange(min=1), help="Default maximum generated tokens.")
+@click.option(
+    "--output",
+    type=click.IntRange(min=1),
+    help="Optional output ceiling; defaults to remaining context.",
+)
 @click.option("--params", help="Parameter count for the table, e.g. 12B.")
 @click.option("--tools/--no-tools", default=None, help="Declare function calling support.")
 def add(model, **options):
@@ -100,6 +146,7 @@ def list_models(as_json):
                         "vision": bool(m.mmproj),
                         "api": ["responses", "chat-completions"],
                         "status": "on" if on else "off",
+                        "limits": token_limits(m, on),
                     }
                     for m, on in rows
                 ],
@@ -107,25 +154,34 @@ def list_models(as_json):
             )
         )
         return
-    table = Table(header_style="bold cyan", border_style="bright_black", expand=False)
+    table = Table(
+        header_style="bold cyan", border_style="blue", expand=False, row_styles=["", "on grey7"]
+    )
     for column in ("model", "params", "context", "output", "vision", "tools", "api", "status"):
         table.add_column(column, no_wrap=column not in ("model", "api"), overflow="fold")
     for m, on in rows:
+        limits = token_limits(m, on)
+        context = f"{limits['max_context_tokens']:,}" if limits["max_context_tokens"] else "unknown"
+        if not m.context and not on:
+            context = "auto ≤ " + context
+        label = Text()
+        if "/" in m.name:
+            owner, leaf = m.name.rsplit("/", 1)
+            label.append(owner + "/", "dim cyan")
+            label.append(leaf, "bold white")
+        else:
+            label.append(m.name, "bold white")
         table.add_row(
-            m.name,
-            m.params,
-            f"{m.context:,}",
-            f"{m.output:,}",
-            "[green]yes[/green]" if m.mmproj else "[dim]no[/dim]",
-            "[green]yes[/green]" if m.tools else "[dim]no[/dim]",
-            "responses | chat-completions",
-            "[green]on[/green]" if on else "[dim]off[/dim]",
+            label,
+            f"[magenta]{m.params}[/]",
+            f"[cyan]{context}[/]",
+            f"[yellow]{m.output:,}[/]" if m.output > 0 else "[yellow]remaining[/]",
+            "[green]✓[/]" if m.mmproj else "[dim]—[/]",
+            "[green]✓[/]" if m.tools else "[dim]—[/]",
+            "[blue]responses[/] | [bright_blue]chat-completions[/]",
+            "[bold green]● on[/]" if on else "[dim]○ off[/]",
         )
     console.print(table)
-    console.print(
-        f"[dim]Context = prompt + images + output. Output = default generation limit.\n"
-        f"Gateway: http://127.0.0.1:{store.proxy_port}/v1[/dim]"
-    )
 
 
 @cli.command()
@@ -146,8 +202,13 @@ def start(model, timeout):
         with console.status(f"Starting {target.name}…"):
             Services(store).start(target, models, timeout)
         console.print(
-            f"[green]Serving[/green] {target.name} at http://127.0.0.1:{store.proxy_port}/v1"
+            f"[bold green]● Ready[/] [bold]{target.name}[/] at [bright_blue]{store.settings.api_url}[/]"
         )
+        if not healthy(store.settings.public_port, "/health/liveliness"):
+            console.print(
+                "[yellow]Activate the configured URL:[/] [bold]sudo ./scripts/setup-url.sh[/]\n"
+                f"[dim]Internal API is ready at http://127.0.0.1:{store.proxy_port}/v1[/]"
+            )
 
 
 @cli.command()
@@ -184,13 +245,37 @@ def completion():
 
 @cli.command("_complete", hidden=True)
 @click.argument("command", required=False)
-def complete(command):
-    # No network, systemctl, or heavyweight imports during TAB completion.
-    names = {m.name for m in Store().read()}
+@click.argument("query", default="")
+@click.option("--describe", is_flag=True)
+def complete(command, query, describe):
+    store = Store()
+    models = store.read()
     if command == "add":
-        names |= set(CATALOG)
-    leaves = [name.split("/")[-1] for name in names]
-    names |= {leaf for leaf in leaves if leaves.count(leaf) == 1}
+        from .hub import normalize_query, search_models
+
+        results = search_models(query, store.state / "hub-completion")
+        remote = [r["id"] for r in results]
+        compact = normalize_query(query).replace("-", "")
+        local = [name for name in CATALOG if compact in normalize_query(name).replace("-", "")]
+        names = list(dict.fromkeys([*remote, *sorted(local)]))
+        by_id = {r["id"]: r for r in results}
+        for name in names:
+            description = "curated preset"
+            if name in by_id:
+                r = by_id[name]
+                description = f"↓ {r.get('downloads', 0):,}  ♥ {r.get('likes', 0):,}"
+            click.echo(f"{name}:{description}" if describe else name)
+        return
+    if command == "stop":
+        services = Services(store)
+        models = [m for m in models if services.active(m.unit)]
+    names = {m.name for m in models}
+    # Offer the short name when it uniquely identifies a model, otherwise the full ID.
+    leaves = [name.split("/")[-1].casefold() for name in names]
+    unique = {leaf for leaf in leaves if leaves.count(leaf) == 1}
+    names = {
+        name.split("/")[-1] if name.split("/")[-1].casefold() in unique else name for name in names
+    }
     click.echo("\n".join(sorted(names)))
 
 

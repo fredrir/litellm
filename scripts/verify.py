@@ -18,7 +18,7 @@ def request(port, route, body):
         data=json.dumps(body).encode(),
         headers={
             "Content-Type": "application/json",
-            "Authorization": "Bearer " + (Store().config / "api-key").read_text().strip(),
+            "Authorization": "Bearer " + Store().settings.require_key(),
         },
     )
     try:

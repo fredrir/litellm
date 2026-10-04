@@ -7,6 +7,11 @@ cd "$project_dir"
 command -v uv >/dev/null || { echo 'Install uv first: https://docs.astral.sh/uv/'; exit 1; }
 command -v nvcc >/dev/null || { echo 'CUDA toolkit (nvcc) is required for this RTX 5070 Ti build.'; exit 1; }
 uv sync --locked
+if [[ ! -f "$project_dir/.env" ]]; then
+  cp "$project_dir/.env.example" "$project_dir/.env"
+  chmod 600 "$project_dir/.env"
+  echo 'Set your LITELLM_API_KEY in .env before adding/starting models.'
+fi
 mkdir -p "$runtime_dir" "$HOME/.local/bin" "$HOME/.zfunc"
 if [[ ! -x "$runtime_dir/proxy/bin/python" ]]; then
   uv venv --python 3.12 "$runtime_dir/proxy"
@@ -33,6 +38,8 @@ fi
 ln -sfn "$project_dir/.venv/bin/litellm" "$HOME/.local/bin/litellm"
 cp "$project_dir/src/litellm_manager/_litellm" "$HOME/.zfunc/_litellm"
 echo 'Installed litellm and zsh completions. Open a new shell to load completions.'
+echo 'For http://litellm.localhost, activate the local forwarding socket:'
+echo "  sudo $project_dir/scripts/setup-url.sh"
 echo 'Add initial models:'
 echo '  litellm add ibm-granite/granite-docling-258M'
 echo '  litellm add PaddlePaddle/PaddleOCR-VL-1.6'
