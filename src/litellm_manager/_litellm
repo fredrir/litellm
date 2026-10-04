@@ -1,0 +1,67 @@
+#compdef litellm
+
+_litellm_models() {
+  local command=$words[1]
+  local -a models
+  models=("${(@f)$(litellm _complete "$command" 2>/dev/null)}")
+  _describe -t models 'model' models
+}
+
+_litellm() {
+  local context state state_descr line
+  typeset -A opt_args
+  local -a commands
+  commands=(
+    'add:Download and register a model'
+    'remove:Stop and unregister a model'
+    'list:Show models and live status'
+    'start:Start serving a model'
+    'stop:Stop serving a model'
+    'logs:Show model or gateway logs'
+    'completion:Print zsh completions'
+  )
+  _arguments -C \
+    '(-h --help)'{-h,--help}'[Show help]' \
+    '--version[Show version]' \
+    '1:command:->command' \
+    '*::argument:->args'
+
+  case $state in
+    command) _describe -t commands 'command' commands ;;
+    args)
+      case $words[1] in
+        add)
+          _arguments \
+            '(-h --help)'{-h,--help}'[Show help]' \
+            '--repo[GGUF repository override]:repository:' \
+            '--file[Exact GGUF filename]:filename:' \
+            '--mmproj[Matching vision projector]:projector:_files -g "*.gguf"' \
+            '--context[Total context tokens]:tokens:(8192 16384 32768 65536)' \
+            '--output[Default maximum output tokens]:tokens:(1024 2048 4096 8192)' \
+            '--params[Parameter count]:params:' \
+            '(--no-tools)--tools[Declare function calling support]' \
+            '(--tools)--no-tools[Disable function calling support]' \
+            '1:model:_litellm_models add'
+          _files -g '*.gguf'
+          ;;
+        start)
+          _arguments '(-h --help)'{-h,--help}'[Show help]' \
+            '--timeout[Startup timeout in seconds]:seconds:(60 180 300)' \
+            '1:model:_litellm_models start' ;;
+        remove|stop)
+          _arguments '(-h --help)'{-h,--help}'[Show help]' \
+            "1:model:_litellm_models $words[1]" ;;
+        list)
+          _arguments '(-h --help)'{-h,--help}'[Show help]' \
+            '--json[Print machine-readable model details]' ;;
+        logs)
+          _arguments '(-h --help)'{-h,--help}'[Show help]' \
+            '(-f --follow)'{-f,--follow}'[Follow new log entries]' \
+            '1:model:_litellm_models logs' ;;
+        completion) _arguments '(-h --help)'{-h,--help}'[Show help]' ;;
+      esac
+      ;;
+  esac
+}
+
+compdef _litellm litellm

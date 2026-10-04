@@ -1,0 +1,23 @@
+[project]
+name = "litellm-manager"
+version = "0.1.0"
+description = "Local CUDA llama.cpp models behind a LiteLLM gateway"
+requires-python = ">=3.12"
+dependencies = ["click>=8.2,<9", "rich>=14,<16", "huggingface-hub>=1,<3", "pyyaml>=6,<7"]
+
+[project.scripts]
+litellm = "litellm_manager.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=9,<10", "ruff>=0.14"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
