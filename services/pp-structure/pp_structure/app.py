@@ -78,14 +78,36 @@ def _iou(a: list[float], b: list[float]) -> float:
     return shared / union if union > 0 else 0.0
 
 
+CPU_MODELS = {
+    "layout_detection_model_name": "PP-DocLayout-L",
+    "text_detection_model_name": "PP-OCRv5_mobile_det",
+    "text_recognition_model_name": "PP-OCRv5_mobile_rec",
+}
+MODEL_ENV = {
+    "layout_detection_model_name": "PP_STRUCTURE_LAYOUT_MODEL",
+    "text_detection_model_name": "PP_STRUCTURE_TEXT_DETECTION_MODEL",
+    "text_recognition_model_name": "PP_STRUCTURE_TEXT_RECOGNITION_MODEL",
+}
+
+
+def model_options(device: str) -> dict[str, str]:
+    """GPU runs the default server models; CPU uses lighter ones (1.6 GiB, ~18 s/page instead of 11 GiB, ~45 s)."""
+    options = dict(CPU_MODELS) if device.startswith("cpu") else {}
+    for option, variable in MODEL_ENV.items():
+        if value := os.environ.get(variable):
+            options[option] = value
+    return options
+
+
 class Analyzer:
     def __init__(self, device: str) -> None:
         from paddleocr import PPStructureV3
 
         self.device = device
+        self.models = model_options(device)
         # Paddle 3.3.1 oneDNN cannot run PP-StructureV3's PIR graphs on CPU.
         cpu = {"enable_mkldnn": False} if device.startswith("cpu") else {}
-        self.pipeline = PPStructureV3(device=device, **cpu, **DISABLED_STAGES)
+        self.pipeline = PPStructureV3(device=device, **cpu, **self.models, **DISABLED_STAGES)
         self.lock = threading.Lock()
 
     def analyze(self, image: np.ndarray) -> LayoutResponse:
@@ -158,6 +180,7 @@ def create_app(device: str | None = None) -> FastAPI:
             "ready": True,
             "service": SERVICE_VERSION,
             "device": analyzer.device,
+            "models": analyzer.models,
             "paddleocr": paddleocr.__version__,
             "paddle": paddle.__version__,
         }

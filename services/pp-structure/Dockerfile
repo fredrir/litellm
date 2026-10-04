@@ -16,7 +16,7 @@ RUN --mount=type=bind,from=uv,source=/uv,target=/usr/local/bin/uv \
     uv sync --frozen --no-dev --extra "$VARIANT"
 ENV PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
 ENV PADDLE_PDX_CACHE_HOME=/models
-RUN /app/.venv/bin/python -c "from paddleocr import PPStructureV3; from pp_structure.app import DISABLED_STAGES; PPStructureV3(device='cpu', **DISABLED_STAGES)" \
+RUN /app/.venv/bin/python -c "from paddleocr import PPStructureV3; from pp_structure.app import DISABLED_STAGES, model_options; PPStructureV3(device='cpu', enable_mkldnn=False, **model_options('cpu' if '$VARIANT' == 'cpu' else 'gpu:0'), **DISABLED_STAGES)" \
     && chmod -R a+rX /models
 EXPOSE 8012
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
