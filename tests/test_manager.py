@@ -248,6 +248,21 @@ def test_occupied_port_never_stops_its_owner(store, model, monkeypatch):
         services.start(model, [model], 1)
 
 
+def test_vision_batches_fit_non_causal_attention_without_splitting_images(
+    store, model, tmp_path, monkeypatch
+):
+    server = tmp_path / "llama-server"
+    server.touch()
+    monkeypatch.setenv("LLAMA_SERVER", str(server))
+    vision = replace(model, name="google/gemma-4-12B-it", mmproj=model.path)
+    args = Services(store).backend_command(vision)
+    batch = int(args[args.index("--batch-size") + 1])
+    ubatch = int(args[args.index("--ubatch-size") + 1])
+    # The default Gemma 4 image budget must fit in one non-causal decode.
+    assert batch >= 1120
+    assert ubatch >= batch
+
+
 def test_remove_unregisters_and_stops_model_without_deleting_shared_weights(
     store, model, monkeypatch
 ):

@@ -330,6 +330,10 @@ class Services:
                 "llama-server is missing. Run scripts/install.sh or set LLAMA_SERVER."
             )
         gguf_file(model.path)
+        # Non-causal vision attention requires each image batch to fit in one
+        # microbatch. 2048 also holds Gemma 4's default 1120 image tokens.
+        batch = 2048 if model.mmproj else 512
+        ubatch = batch if model.mmproj else 256
         args = [
             server,
             "--model",
@@ -355,9 +359,9 @@ class Services:
             "--cache-type-v",
             model.cache,
             "--batch-size",
-            "512",
+            str(batch),
             "--ubatch-size",
-            "256",
+            str(ubatch),
             "--jinja",
             "--no-context-shift",
             "--fit",
