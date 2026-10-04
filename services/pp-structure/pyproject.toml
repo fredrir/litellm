@@ -1,0 +1,36 @@
+[project]
+name = "pp-structure"
+version = "0.1.0"
+description = "PaddleOCR PP-StructureV3 layout and OCR service"
+requires-python = "==3.13.*"
+dependencies = [
+  "paddleocr[doc-parser]==3.7.0",
+  "fastapi>=0.142.2",
+  "uvicorn>=0.54.0",
+  "pillow>=12.3.0",
+  "numpy>=2.0.0",
+  "pydantic>=2.13.5",
+]
+
+[project.optional-dependencies]
+gpu = ["paddlepaddle-gpu==3.4.0"]
+cpu = ["paddlepaddle==3.3.1"]
+
+[project.scripts]
+pp-structure = "pp_structure.app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+conflicts = [[{ extra = "gpu" }, { extra = "cpu" }]]
+index-strategy = "unsafe-best-match"
+
+[[tool.uv.index]]
+name = "paddle-cu130"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cu130/"
+explicit = true
+
+[tool.uv.sources]
+paddlepaddle-gpu = { index = "paddle-cu130" }

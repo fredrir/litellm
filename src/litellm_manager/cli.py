@@ -9,8 +9,17 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .catalog import CATALOG
-from .core import Services, Store, available_port, download_model, healthy, resolve
+from .catalog import CATALOG, SERVICES, service_for
+from .core import (
+    Service,
+    Services,
+    Store,
+    add_service,
+    available_port,
+    download_model,
+    healthy,
+    resolve,
+)
 from .metadata import token_limits
 
 console = Console()
@@ -83,14 +92,19 @@ def cli(ctx):
 @click.option("--params", help="Parameter count for the table, e.g. 12B.")
 @click.option("--tools/--no-tools", default=None, help="Declare function calling support.")
 def add(model, **options):
-    """Download and register a model and its vision projector. Existing downloads are reused."""
+    """Download and register a model and its vision projector, or a managed service."""
     store = Store()
     with console.status(f"Adding {model}…"):
         from huggingface_hub.errors import HfHubHTTPError
 
         # Download outside the mutation lock so existing models remain controllable.
         try:
-            new = download_model(model, store.read(), store.proxy_port, **options)
+            if service_for(model):
+                if any(value is not None for value in options.values()):
+                    raise click.ClickException("Options apply to GGUF models only.")
+                new = add_service(model, store.read(), store.proxy_port)
+            else:
+                new = download_model(model, store.read(), store.proxy_port, **options)
         except HfHubHTTPError as exc:
             raise click.ClickException(
                 f"Hugging Face download failed: {exc}. "
@@ -143,6 +157,12 @@ def list_models(as_json):
                 [
                     {
                         **asdict(m),
+                        "api": [f"pass-through {m.route}"],
+                        "status": "on" if on else "off",
+                    }
+                    if isinstance(m, Service)
+                    else {
+                        **asdict(m),
                         "vision": bool(m.mmproj),
                         "api": ["responses", "chat-completions"],
                         "status": "on" if on else "off",
@@ -160,10 +180,6 @@ def list_models(as_json):
     for column in ("model", "params", "context", "output", "vision", "tools", "api", "status"):
         table.add_column(column, no_wrap=column not in ("model", "api"), overflow="fold")
     for m, on in rows:
-        limits = token_limits(m, on)
-        context = f"{limits['max_context_tokens']:,}" if limits["max_context_tokens"] else "unknown"
-        if not m.context and not on:
-            context = "auto ≤ " + context
         label = Text()
         if "/" in m.name:
             owner, leaf = m.name.rsplit("/", 1)
@@ -171,6 +187,15 @@ def list_models(as_json):
             label.append(leaf, "bold white")
         else:
             label.append(m.name, "bold white")
+        status = "[bold green]● on[/]" if on else "[dim]○ off[/]"
+        if isinstance(m, Service):
+            na = "[dim]n/a[/]"
+            table.add_row(label, na, na, na, na, na, f"[blue]pass-through[/] {m.route}", status)
+            continue
+        limits = token_limits(m, on)
+        context = f"{limits['max_context_tokens']:,}" if limits["max_context_tokens"] else "unknown"
+        if not m.context and not on:
+            context = "auto ≤ " + context
         table.add_row(
             label,
             f"[magenta]{m.params}[/]",
@@ -179,7 +204,7 @@ def list_models(as_json):
             "[green]✓[/]" if m.mmproj else "[dim]—[/]",
             "[green]✓[/]" if m.tools else "[dim]—[/]",
             "[blue]responses[/] | [bright_blue]chat-completions[/]",
-            "[bold green]● on[/]" if on else "[dim]○ off[/]",
+            status,
         )
     console.print(table)
 
@@ -256,11 +281,15 @@ def complete(command, query, describe):
         results = search_models(query, store.state / "hub-completion")
         remote = [r["id"] for r in results]
         compact = normalize_query(query).replace("-", "")
-        local = [name for name in CATALOG if compact in normalize_query(name).replace("-", "")]
+        local = [
+            name
+            for name in [*CATALOG, *SERVICES]
+            if compact in normalize_query(name).replace("-", "")
+        ]
         names = list(dict.fromkeys([*remote, *sorted(local)]))
         by_id = {r["id"]: r for r in results}
         for name in names:
-            description = "curated preset"
+            description = "service" if name in SERVICES else "curated preset"
             if name in by_id:
                 r = by_id[name]
                 description = f"↓ {r.get('downloads', 0):,}  ♥ {r.get('likes', 0):,}"

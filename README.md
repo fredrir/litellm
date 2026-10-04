@@ -1,6 +1,6 @@
 # litellm
 
-Native CUDA llama.cpp models through a local LiteLLM gateway.
+Native CUDA llama.cpp models and managed services through a local LiteLLM gateway.
 
 ```zsh
 litellm                         # dashboard
@@ -9,6 +9,7 @@ litellm list --json
 litellm add <TAB>               # popular Hugging Face GGUF models
 litellm add gemma4<TAB>         # model search, ranked by relevance/downloads/likes
 litellm add unsloth/gemma-4-12b-it-GGUF
+litellm add PaddlePaddle/PP-StructureV3    # managed service, see Services
 litellm start gemma-4-12b-it-GGUF
 litellm stop gemma-4-12b-it-GGUF
 litellm remove gemma-4-12b-it-GGUF
@@ -82,6 +83,27 @@ Custom GGUF repositories with several quantizations require `--file`; `--mmproj`
 
 Granite's prompt is `Convert this page to docling.` and its output is DocTags. PaddleOCR uses `OCR:`, `Table Recognition:`, or `Formula Recognition:`. Send images as OpenAI data-URL image content blocks. PDF rasterization/layout and Markdown conversion belong to the Docling/PaddleOCR pipelines.
 
+## Services
+
+Managed like models: `add`, `start`, `stop`, `remove`, `logs`.
+
+| Service | Value |
+| --- | --- |
+| Name | `PaddlePaddle/PP-StructureV3` |
+| Source | `services/pp-structure` (own uv project and Dockerfile, `VARIANT=gpu\|cpu`) |
+| Gateway route | `/pp-structure`, LiteLLM pass-through, gateway key required |
+| Upstream | `GET /health`, `POST /v1/layout` on an allocated loopback port |
+| `add` | `uv sync --frozen --extra gpu`; `cpu` without `nvidia-smi` |
+| Weights | `~/.paddlex/official_models`, downloaded on first start |
+| Request | `{"png": "<base64 PNG>"}` |
+| Response | `width`, `height`, `blocks[label, bbox, score, order, text]`, `lines[bbox, text, score]`, `duration_ms` |
+
+```zsh
+curl -H "Authorization: Bearer $LITELLM_API_KEY" $LITELLM_URL/pp-structure/health
+curl -H "Authorization: Bearer $LITELLM_API_KEY" -H 'Content-Type: application/json' \
+  -d "{\"png\": \"$(base64 -w0 page.png)\"}" $LITELLM_URL/pp-structure/v1/layout
+```
+
 ## Completion and verification
 
 Hugging Face completions search GGUF repositories, normalize inputs such as `gemma4`, rank name relevance ahead of popularity, display downloads/likes, and retain API results for 15 minutes. Network requests have bounded timeouts; stale cached results and curated models remain available offline. `start`, `stop`, `remove`, and `logs` complete registered models without network access.
@@ -91,7 +113,7 @@ Hugging Face completions search GGUF repositories, normalize inputs such as `gem
 source ~/.zfunc/_litellm       # or open a new shell
 uv run pytest -q
 uv run ruff check src tests scripts/verify.py
-uv run python scripts/verify.py   # live API/vision/tool checks; restores prior running states
+uv run python scripts/verify.py   # live API/vision/tool/service checks; restores prior running states
 ```
 
 Add/remove refreshes a running gateway's collection. Do that between requests. Model processes are systemd user services and survive terminal exit.
@@ -102,6 +124,8 @@ Add/remove refreshes a running gateway's collection. Do that between requests. M
 | --- | --- |
 | [llama.cpp server](https://github.com/ggml-org/llama.cpp/blob/v0.5.0/tools/server/README.md) | APIs, memory fit, context, Flash Attention, Jinja |
 | [LiteLLM compatible endpoints](https://docs.litellm.ai/docs/providers/openai_compatible) | Local provider routing |
+| [LiteLLM pass-through](https://docs.litellm.ai/docs/proxy/pass_through) | Service routes and auth |
+| [PP-StructureV3](https://www.paddleocr.ai/latest/en/version3.x/pipeline_usage/PP-StructureV3.html) | Layout and OCR pipeline |
 | [Hugging Face search](https://huggingface.co/docs/huggingface_hub/en/guides/search) | Search and popularity sorting |
 | [Unsloth Gemma GGUF](https://huggingface.co/unsloth/gemma-4-12b-it-GGUF) | Exact quantization and matching projector |
 | [Gemma model card](https://huggingface.co/google/gemma-4-12B-it) | Sampling |

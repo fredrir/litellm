@@ -8,14 +8,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from litellm_manager.core import Services, Store, resolve
+from litellm_manager.core import Service, Services, Store, resolve
 
 
-def request(port, route, body):
+def request(port, route, body=None):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/v1/{route}",
-        data=json.dumps(body).encode(),
+        f"http://127.0.0.1:{port}" + (route if route.startswith("/") else f"/v1/{route}"),
+        data=json.dumps(body).encode() if body is not None else None,
         headers={
             "Content-Type": "application/json",
             "Authorization": "Bearer " + Store().settings.require_key(),
@@ -41,6 +41,25 @@ def main():
             subprocess.run(
                 [sys.executable, "-m", "litellm_manager.cli", "start", model.name], check=True
             )
+            if isinstance(model, Service):
+                health = request(store.proxy_port, f"{model.route}/health")
+                assert health.get("ready"), health
+                layout = request(
+                    store.proxy_port,
+                    f"{model.route}/v1/layout",
+                    {"png": base64.b64encode(fixture.read_bytes()).decode()},
+                )
+                assert layout["blocks"] or layout["lines"], layout
+                print(
+                    model.name,
+                    "layout:",
+                    len(layout["blocks"]),
+                    "blocks,",
+                    len(layout["lines"]),
+                    "lines",
+                    flush=True,
+                )
+                continue
             prompt = (
                 "Convert this page to docling."
                 if "docling" in model.name

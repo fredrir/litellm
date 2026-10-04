@@ -10,16 +10,16 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 from pathlib import Path
 
 import click
 import yaml
 
-from .catalog import preset_for
+from .catalog import preset_for, service_for
 from .metadata import model_metadata, token_limits
-from .settings import Settings
+from .settings import PROJECT, Settings
 
 
 @dataclass
@@ -45,6 +45,25 @@ class Model:
         return "litellm-model-" + sha256(self.name.encode()).hexdigest()[:16] + ".service"
 
 
+@dataclass
+class Service:
+    name: str
+    project: str
+    script: str
+    route: str
+    extra: str
+    port: int
+    env: list[str] = field(default_factory=list)
+    kind: str = "service"
+
+    @property
+    def unit(self) -> str:
+        return "litellm-service-" + sha256(self.name.encode()).hexdigest()[:16] + ".service"
+
+
+Entry = Model | Service
+
+
 class Store:
     def __init__(self):
         self.settings = Settings()
@@ -59,11 +78,14 @@ class Store:
         self.proxy_config = self.config / "proxy.yaml"
         self.proxy_port = self.settings.port
 
-    def read(self) -> list[Model]:
+    def read(self) -> list[Entry]:
         if not self.registry.exists():
             return []
         try:
-            return [Model(**m) for m in json.loads(self.registry.read_text())]
+            return [
+                Service(**m) if m.get("kind") == "service" else Model(**m)
+                for m in json.loads(self.registry.read_text())
+            ]
         except (ValueError, TypeError, OSError) as exc:
             raise click.ClickException(f"Cannot read {self.registry}: {exc}") from exc
 
@@ -74,7 +96,7 @@ class Store:
             fcntl.flock(lock, fcntl.LOCK_EX)
             yield
 
-    def save(self, models: list[Model]):
+    def save(self, models: list[Entry]):
         atomic_write(self.registry, json.dumps([asdict(m) for m in models], indent=2) + "\n")
 
 
@@ -91,7 +113,7 @@ def atomic_write(path: Path, text: str):
         Path(temp).unlink(missing_ok=True)
 
 
-def resolve(models: list[Model], name: str) -> Model:
+def resolve(models: list[Entry], name: str) -> Entry:
     exact = [m for m in models if m.name.casefold() == name.casefold()]
     matches = exact or [m for m in models if m.name.split("/")[-1].casefold() == name.casefold()]
     if len(matches) != 1:
@@ -100,7 +122,7 @@ def resolve(models: list[Model], name: str) -> Model:
     return matches[0]
 
 
-def available_port(models: list[Model], proxy_port: int) -> int:
+def available_port(models: list[Entry], proxy_port: int) -> int:
     reserved = {m.port for m in models} | {proxy_port}
     for port in range(8100, 9000):
         if port not in reserved and port_free(port):
@@ -225,6 +247,48 @@ def download_model(
     )
 
 
+def uv_binary() -> str:
+    uv = shutil.which("uv")
+    if not uv:
+        raise click.ClickException("uv not found. Install uv: https://docs.astral.sh/uv/")
+    return str(Path(uv).resolve())
+
+
+def add_service(name: str, models: list[Entry], proxy_port: int) -> Service:
+    canonical, preset = service_for(name)
+    if any(m.name.casefold() == canonical.casefold() for m in models):
+        raise click.ClickException(f"Already added: {canonical}")
+    project = PROJECT / preset.project
+    extra = "gpu" if shutil.which("nvidia-smi") else "cpu"
+    result = subprocess.run(
+        [uv_binary(), "sync", "--project", str(project), "--frozen", "--extra", extra],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        raise click.ClickException(f"uv sync failed:\n{result.stderr.strip()[-2000:]}")
+    return Service(
+        canonical,
+        str(project),
+        preset.script,
+        preset.route,
+        extra,
+        available_port(models, proxy_port),
+        list(preset.env),
+    )
+
+
+def pass_through(service: Service) -> dict:
+    return {
+        "path": service.route,
+        "target": f"http://127.0.0.1:{service.port}",
+        "include_subpath": True,
+        "auth": True,
+        "timeout": 300,
+    }
+
+
 class Services:
     proxy_unit = "litellm-manager-proxy.service"
 
@@ -252,7 +316,7 @@ class Services:
     def active(self, unit: str) -> bool:
         return self.ctl("is-active", "--quiet", unit, check=False).returncode == 0
 
-    def ready(self, model: Model) -> bool:
+    def ready(self, model: Entry) -> bool:
         return self.active(model.unit) and healthy(model.port, "/health")
 
     def backend_command(self, model: Model) -> list[str]:
@@ -320,13 +384,39 @@ class Services:
             args.extend(["--mmproj", gguf_file(model.mmproj)])
         return args
 
-    def write_unit(self, unit: str, args: list[str], *, backend: bool = False):
+    def service_command(self, service: Service) -> list[str]:
+        if not (Path(service.project) / "pyproject.toml").is_file():
+            raise click.ClickException(f"Service project missing: {service.project}")
+        return [
+            uv_binary(),
+            "run",
+            "--project",
+            service.project,
+            "--frozen",
+            "--extra",
+            service.extra,
+            service.script,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(service.port),
+        ]
+
+    def command(self, entry: Entry) -> list[str]:
+        if isinstance(entry, Service):
+            return self.service_command(entry)
+        return self.backend_command(entry)
+
+    def write_unit(
+        self, unit: str, args: list[str], *, backend: bool = False, extra_env: tuple[str, ...] = ()
+    ):
         command = " ".join(systemd_quote(arg) for arg in args)
         environment = (
             "Environment=CUDA_VISIBLE_DEVICES=0\n"
             if backend
             else ("Environment=LITELLM_LOCAL_MODEL_COST_MAP=True\nEnvironment=DO_NOT_TRACK=1\n")
         )
+        environment += "".join(f"Environment={systemd_quote(e)}\n" for e in extra_env)
         if not backend:
             environment += (
                 "Environment="
@@ -341,10 +431,14 @@ class Services:
             "UMask=0077\n",
         )
 
-    def configure_proxy(self, models: list[Model]):
+    def configure_proxy(self, entries: list[Entry]):
         self.store.settings.require_key()
         rows = []
-        for model in models:
+        general = {"master_key": "os.environ/LITELLM_MASTER_KEY"}
+        routes = [pass_through(e) for e in entries if isinstance(e, Service)]
+        if routes:
+            general["pass_through_endpoints"] = routes
+        for model in (e for e in entries if isinstance(e, Model)):
             rows.append(
                 {
                     "model_name": model.name,
@@ -372,7 +466,7 @@ class Services:
             yaml.safe_dump(
                 {
                     "model_list": rows,
-                    "general_settings": {"master_key": "os.environ/LITELLM_MASTER_KEY"},
+                    "general_settings": general,
                     "litellm_settings": {"telemetry": False, "request_timeout": 300},
                     "router_settings": {"num_retries": 0},
                 },
@@ -406,7 +500,7 @@ class Services:
             f"{settings.url}\n{settings.port}\n{settings.require_key()}".encode()
         ).hexdigest()
 
-    def refresh(self, models: list[Model]):
+    def refresh(self, models: list[Entry]):
         was_active = self.active(self.proxy_unit)
         unit_path = self.store.units / self.proxy_unit
         previous = {
@@ -456,14 +550,19 @@ class Services:
             check=False,
         ).stdout.strip()
 
-    def start(self, model: Model, models: list[Model], timeout: float):
+    def start(self, model: Entry, models: list[Entry], timeout: float):
         started_here = not self.active(model.unit)
         if started_here:
             if not port_free(model.port):
                 raise click.ClickException(
                     f"Backend port {model.port} is occupied. Stop its owner first."
                 )
-            self.write_unit(model.unit, self.backend_command(model), backend=True)
+            self.write_unit(
+                model.unit,
+                self.command(model),
+                backend=True,
+                extra_env=tuple(model.env) if isinstance(model, Service) else (),
+            )
             self.ctl("daemon-reload")
             self.ctl("reset-failed", model.unit, check=False)
             self.ctl("start", model.unit)
@@ -491,7 +590,7 @@ class Services:
                 self.ctl("stop", self.proxy_unit, check=False)
             raise
 
-    def stop(self, model: Model, models: list[Model]):
+    def stop(self, model: Entry, models: list[Entry]):
         if (self.store.units / model.unit).exists():
             self.ctl("stop", model.unit)
         if (

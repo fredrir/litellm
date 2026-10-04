@@ -7,9 +7,18 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
-from litellm_manager.catalog import CATALOG
+from litellm_manager.catalog import CATALOG, SERVICES
 from litellm_manager.cli import cli
-from litellm_manager.core import Model, Services, Store, download_model, resolve
+from litellm_manager.core import (
+    Model,
+    Service,
+    Services,
+    Store,
+    add_service,
+    download_model,
+    resolve,
+)
+from litellm_manager.settings import PROJECT
 
 
 @pytest.fixture
@@ -34,6 +43,22 @@ def model(tmp_path):
     write_gguf(path)
     return Model(
         "test/model", "local", "local", str(path), None, "1B", 8192, 2048, None, False, 8100
+    )
+
+
+@pytest.fixture
+def service(tmp_path):
+    project = tmp_path / "pp-structure"
+    project.mkdir()
+    (project / "pyproject.toml").touch()
+    return Service(
+        "PaddlePaddle/PP-StructureV3",
+        str(project),
+        "pp-structure",
+        "/pp-structure",
+        "gpu",
+        8103,
+        ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True"],
     )
 
 
@@ -104,7 +129,7 @@ def test_add_completion_reads_registry_without_network_or_systemd(store, model, 
     monkeypatch.setattr(subprocess, "run", forbidden)
     result = CliRunner().invoke(cli, ["_complete", "add"])
     assert result.exit_code == 0
-    assert set(result.output.splitlines()) == set(CATALOG)
+    assert set(result.output.splitlines()) == set(CATALOG) | set(SERVICES)
 
 
 def test_stop_completion_only_lists_running_models(store, model, monkeypatch):
@@ -255,3 +280,104 @@ def test_add_preserves_models_registered_during_download(store, model, monkeypat
     saved = store.read()
     assert {m.name for m in saved} == {model.name, other.name}
     assert len({m.port for m in saved}) == 2
+
+
+def test_registry_keeps_services_beside_models(store, model, service):
+    store.save([model, service])
+    assert store.read() == [model, service]
+    assert resolve(store.read(), "pp-structurev3") == service
+    assert service.unit.startswith("litellm-service-")
+    assert json.loads(store.registry.read_text())[1]["kind"] == "service"
+
+
+def test_add_service_syncs_project_venv_without_downloading_weights(store, model, monkeypatch):
+    calls = []
+    monkeypatch.setattr("litellm_manager.core.shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("litellm_manager.core.port_free", lambda port: True)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda args, **kw: calls.append(args) or subprocess.CompletedProcess(args, 0),
+    )
+    added = add_service("PP-StructureV3", [model], 4010)
+    project = str(PROJECT / "services/pp-structure")
+    assert calls == [["/usr/bin/uv", "sync", "--project", project, "--frozen", "--extra", "gpu"]]
+    assert (added.name, added.project, added.route, added.port) == (
+        "PaddlePaddle/PP-StructureV3",
+        project,
+        "/pp-structure",
+        8101,
+    )
+    with pytest.raises(click.ClickException, match="Already added"):
+        add_service("PaddlePaddle/PP-StructureV3", [added], 4010)
+
+
+def test_add_service_rejects_gguf_options(store):
+    result = CliRunner().invoke(cli, ["add", "PaddlePaddle/PP-StructureV3", "--context", "8192"])
+    assert result.exit_code == 1
+    assert "GGUF models only" in result.output
+
+
+def test_service_unit_runs_project_script_on_its_port(store, service, monkeypatch):
+    monkeypatch.setattr("litellm_manager.core.shutil.which", lambda name: "/usr/bin/uv")
+    services = Services(store)
+    args = services.command(service)
+    assert args == [
+        "/usr/bin/uv",
+        "run",
+        "--project",
+        service.project,
+        "--frozen",
+        "--extra",
+        "gpu",
+        "pp-structure",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8103",
+    ]
+    services.write_unit(service.unit, args, backend=True, extra_env=tuple(service.env))
+    unit = (store.units / service.unit).read_text()
+    assert 'Environment="PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True"' in unit
+    assert "Environment=CUDA_VISIBLE_DEVICES=0" in unit
+
+
+def test_proxy_exposes_services_as_authenticated_pass_through(store, model, service, monkeypatch):
+    runtime = store.data / "runtime/proxy/bin/litellm"
+    runtime.parent.mkdir(parents=True)
+    runtime.touch()
+    monkeypatch.setattr(Services, "ctl", lambda *args, **kwargs: None)
+    Services(store).configure_proxy([model, service])
+    config = yaml.safe_load(store.proxy_config.read_text())
+    assert [row["model_name"] for row in config["model_list"]] == [model.name]
+    assert config["general_settings"]["pass_through_endpoints"] == [
+        {
+            "path": "/pp-structure",
+            "target": "http://127.0.0.1:8103",
+            "include_subpath": True,
+            "auth": True,
+            "timeout": 300,
+        }
+    ]
+    Services(store).configure_proxy([model])
+    assert (
+        "pass_through_endpoints"
+        not in yaml.safe_load(store.proxy_config.read_text())["general_settings"]
+    )
+
+
+def test_list_shows_service_route_without_token_limits(store, model, service, monkeypatch):
+    store.save([model, service])
+    monkeypatch.setattr(Services, "active", lambda self, unit: True)
+    monkeypatch.setattr(Services, "ready", lambda self, m: True)
+    monkeypatch.setattr("litellm_manager.cli.healthy", lambda port, route: True)
+    monkeypatch.setattr("litellm_manager.metadata.live_context", lambda port: None)
+    result = CliRunner().invoke(cli, ["list", "--json"])
+    assert result.exit_code == 0
+    row = json.loads(result.output)[1]
+    assert row["api"] == ["pass-through /pp-structure"]
+    assert row["status"] == "on"
+    assert "limits" not in row
+    table = CliRunner().invoke(cli, ["list"])
+    assert table.exit_code == 0
+    assert "pass-through /pp-structure" in table.output

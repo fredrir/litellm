@@ -58,6 +58,31 @@ CATALOG = {
 }
 
 
+@dataclass(frozen=True)
+class ServicePreset:
+    project: str
+    script: str
+    route: str
+    env: tuple[str, ...] = ()
+
+
+SERVICES = {
+    "PaddlePaddle/PP-StructureV3": ServicePreset(
+        "services/pp-structure",
+        "pp-structure",
+        "/pp-structure",
+        ("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True",),
+    ),
+}
+
+
+def service_for(name: str) -> tuple[str, ServicePreset] | None:
+    for key, value in SERVICES.items():
+        if name.casefold() in (key.casefold(), key.split("/")[-1].casefold()):
+            return key, value
+    return None
+
+
 def preset_for(name: str) -> tuple[str, Preset] | None:
     for key, value in CATALOG.items():
         if name.casefold() in (key.casefold(), key.split("/")[-1].casefold()):

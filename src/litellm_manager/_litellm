@@ -17,7 +17,7 @@ _litellm() {
   typeset -A opt_args
   local -a commands
   commands=(
-    'add:Download and register a model'
+    'add:Add a model or service'
     'remove:Stop and unregister a model'
     'list:Show models and live status'
     'start:Start serving a model'
